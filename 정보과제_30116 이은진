@@ -1,0 +1,154 @@
+import requests
+from datetime import datetime
+import pytz
+import xml.etree.ElementTree as ET
+
+# 설정값
+hours = [0, 3, 6, 9, 12, 15, 18, 21]
+base_demand = [50, 48, 55, 70, 90, 88, 75, 60]
+LCOE_solar, LCOE_wind, LCOE_nuclear, LCOE_storage = 40, 35, 50, 10
+nuclear_output = 35
+storage_capacity = 50
+storage = 0
+API_KEY = "nAPRhhwgx6B9Dj4nVS6QflPVWzqLfvAMl1NfMNch3k70Th7maQKQLJnX4HvXeplvcDVyo1P7Ch9FRvUIZ0JvOg=="
+weather_impact = {"맑음": 1.0, "흐림": 0.75, "비": 0.5}
+
+# 시나리오 선택
+print("시나리오를 선택하세요:")
+print("1. 봄철")
+print("2. 여름철")
+print("3. 가을철")
+print("4. 겨울철")
+print("5. 오늘 날씨")
+scenario = int(input("번호 입력: "))
+use_kma = (scenario == 5)
+
+def calculate_pm25_impact(pm25):
+    return max(0.5, 1 - 0.005 * (pm25 / 10))
+
+def get_kma_weather_data():
+    try:
+        nx, ny = 60, 120  # 온양6동
+        base_date = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y%m%d')
+        base_time = "0200"
+        url = f"http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst" \
+              f"?serviceKey={API_KEY}&numOfRows=500&pageNo=1&dataType=XML" \
+              f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
+        res = requests.get(url)
+        root = ET.fromstring(res.content)
+
+        temp_dict, wind_dict, sky_dict = {}, {}, {}
+        for item in root.iter("item"):
+            category = item.find("category").text
+            fcstTime = item.find("fcstTime").text
+            fcstValue = item.find("fcstValue").text
+            if fcstTime in [f"{h:02d}00" for h in hours]:
+                if category == "TMP":
+                    temp_dict[fcstTime] = float(fcstValue)
+                elif category == "WSD":
+                    wind_dict[fcstTime] = float(fcstValue)
+                elif category == "SKY":
+                    sky_dict[fcstTime] = int(fcstValue)
+
+        temp = [temp_dict[f"{h:02d}00"] for h in hours]
+        wind = [wind_dict[f"{h:02d}00"] for h in hours]
+        weather = [("맑음" if sky_dict[f"{h:02d}00"] <= 5 else "흐림") for h in hours]
+        solar_rad = [800 if 6 <= h <= 18 and w == "맑음" else 300 if 6 <= h <= 18 else 0 for h, w in zip(hours, weather)]
+        pm25 = [30] * 8
+
+        return temp, solar_rad, wind, pm25, weather
+    except Exception as e:
+        print("기상청 데이터 오류:", e)
+        return [25]*8, [500]*8, [5]*8, [30]*8, ["맑음"]*8
+
+def get_scenario_weather(scenario):
+    if scenario == 1:  # 봄철
+        return [18]*8, [600]*8, [6]*8, [25]*8, ["맑음"]*8
+    elif scenario == 2:  # 여름
+        return [30]*8, [850]*8, [4]*8, [40]*8, ["맑음"]*8
+    elif scenario == 3:  # 가을
+        return [20]*8, [700]*8, [5]*8, [20]*8, ["맑음"]*8
+    elif scenario == 4:  # 겨울
+        return [0]*8, [250]*8, [7]*8, [35]*8, ["흐림"]*8
+    else:
+        raise ValueError("올바른 시나리오 번호를 입력하세요.")
+
+def calculate_renewable_energy(temp, solar_rad, wind_speed, pm25, weather):
+    solar, wind = [], []
+    for i in range(8):
+        base = max(0, (solar_rad[i] / 1000) * 50 * (1 - 0.005 * (temp[i] - 25)))
+        eff = calculate_pm25_impact(pm25[i]) * weather_impact.get(weather[i], 1.0)
+        solar.append(base * eff)
+        wind.append(0 if wind_speed[i] < 3 or wind_speed[i] > 25 else 30 * (wind_speed[i] / 10) ** 3)
+    return solar, wind
+
+def optimize_energy_mix(solar, wind, demand):
+    global storage
+    optimized_solar, optimized_wind, storage_usage, ess_storage_log = [], [], [], []
+    total_cost = 0
+
+    for i in range(8):
+        required = demand[i] - nuclear_output
+        available = solar[i] + wind[i]
+
+        if available < required:
+            used = min(storage, required - available)
+            storage -= used
+            storage_usage.append(used)
+        else:
+            surplus = available - required
+            if storage + surplus <= storage_capacity:
+                storage += surplus
+            else:
+                surplus -= (storage_capacity - storage)
+                storage = storage_capacity
+            ratio_s = solar[i] / available if available else 0
+            ratio_w = wind[i] / available if available else 0
+            solar[i] -= surplus * ratio_s
+            wind[i] -= surplus * ratio_w
+            storage_usage.append(0)
+
+        optimized_solar.append(solar[i])
+        optimized_wind.append(wind[i])
+        ess_storage_log.append(storage)
+        total_cost += (solar[i] * LCOE_solar) + (wind[i] * LCOE_wind) + (nuclear_output * LCOE_nuclear) + (storage_usage[i] * LCOE_storage)
+
+    return optimized_solar, optimized_wind, total_cost, storage_usage, ess_storage_log
+
+# 데이터 불러오기
+if use_kma:
+    temp, solar_rad, wind_spd, pm25, weather = get_kma_weather_data()
+else:
+    temp, solar_rad, wind_spd, pm25, weather = get_scenario_weather(scenario)
+
+# 계산
+solar, wind = calculate_renewable_energy(temp, solar_rad, wind_spd, pm25, weather)
+solar_opt, wind_opt, cost_opt, storage_used, ess_storage = optimize_energy_mix(solar, wind, base_demand)
+
+# 출력
+scenario_names = {
+    1: "봄철",
+    2: "여름철",
+    3: "가을철",
+    4: "겨울철",
+    5: "오늘 날씨"
+}
+print(f"\n▶ 시나리오 {scenario} ({scenario_names.get(scenario, '알 수 없음')}) 기준 결과")
+
+print("\n⚡ 에너지 발전량 예측")
+for i in range(8):
+    total = solar_opt[i] + wind_opt[i] + nuclear_output
+    print(f"{hours[i]:02d}시 - 태양광: {solar_opt[i]:.1f}MW, 풍력: {wind_opt[i]:.1f}MW, 원자력: {nuclear_output:.1f}MW, 총: {total:.1f}MW")
+
+print(f"\n💰 총 발전 비용: {cost_opt:,.0f} 원")
+
+print("\n🔋 ESS 저장량 및 사용량")
+for i in range(8):
+    print(f"{hours[i]:02d}시 - 사용량: {storage_used[i]:.1f}MW, 저장량: {ess_storage[i]:.1f}MW")
+
+print("\n✅ 날씨 정보")
+print("🌡️ 기온:", temp)
+print("☀️ 일사량:", solar_rad)
+print("💨 풍속:", wind_spd)
+print("🌫️ PM2.5:", pm25)
+print("🌦️ 상태:", weather)
